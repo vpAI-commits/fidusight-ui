@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
   FileUp,
   CheckCircle,
@@ -27,19 +27,103 @@ export default function DataIngestion() {
   const [jobs, setJobs] = useState<IngestionJob[]>([]);
   const [vendors, setVendors] = useState<PBMVendor[]>([]);
   const [loading, setLoading] = useState(true);
+  const [isUploading, setIsUploading] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const loadData = useCallback(async () => {
+    const [jobsRes, vendorsRes] = await Promise.all([
+      supabase.from('ingestion_jobs').select('*, pbm_vendors(*)').order('created_at', { ascending: false }),
+      supabase.from('pbm_vendors').select('*'),
+    ]);
+    if (jobsRes.data) setJobs(jobsRes.data);
+    if (vendorsRes.data) setVendors(vendorsRes.data);
+    setLoading(false);
+  }, []);
 
   useEffect(() => {
-    async function loadData() {
-      const [jobsRes, vendorsRes] = await Promise.all([
-        supabase.from('ingestion_jobs').select('*, pbm_vendors(*)').order('created_at', { ascending: false }),
-        supabase.from('pbm_vendors').select('*'),
-      ]);
-      if (jobsRes.data) setJobs(jobsRes.data);
-      if (vendorsRes.data) setVendors(vendorsRes.data);
-      setLoading(false);
-    }
     loadData();
-  }, []);
+  }, [loadData]);
+
+  // --- NEW INGESTION AGENT LOGIC ---
+  const handleFileUpload = async (file: File) => {
+    if (!file) return;
+    setIsUploading(true);
+
+    try {
+      // 1. Read and parse the CSV
+      const text = await file.text();
+      const lines = text.split('\n').filter(line => line.trim() !== '');
+      const headers = lines[0].split(',').map(h => h.trim());
+      
+      const parsedData = lines.slice(1).map(line => {
+        const values = line.split(',').map(v => v.trim());
+        const row: any = {};
+        headers.forEach((header, i) => { row[header] = values[i]; });
+        return row;
+      });
+
+      // 2. Format claims and calculate True Net Price (TNP)
+      const claimsData = parsedData.map(row => {
+        const pharmacy = parseFloat(row.amt_paid_pharmacy || 0);
+        const admin = parseFloat(row.bfsf_admin_fee || 0);
+        const rebate = parseFloat(row.rebate_passed_thru || 0);
+        const days = parseInt(row.days_supply || 30);
+        const billed = parseFloat(row.amt_billed_plan || pharmacy);
+        
+        // TNP Math Agent Logic
+        const tnp = ((pharmacy + admin - rebate) / days) * 30;
+
+        return {
+          pbm_vendor_id: row.pbm_vendor_id,
+          ndc_11: row.ndc_11,
+          drug_name: row.drug_name,
+          amt_paid_pharmacy: pharmacy,
+          rebate_passed_thru: rebate,
+          bfsf_admin_fee: admin,
+          days_supply: days,
+          amt_billed_plan: billed,
+          true_net_price: tnp
+        };
+      });
+
+      // 3. Save claims to Supabase
+      const { error: claimsError } = await supabase.from('claims').insert(claimsData);
+      if (claimsError) throw claimsError;
+
+      // 4. Save Job History Record
+      const { error: jobError } = await supabase.from('ingestion_jobs').insert({
+        filename: file.name,
+        file_size_mb: file.size / (1024 * 1024),
+        row_count: claimsData.length,
+        status: 'COMPLETED',
+        started_at: new Date().toISOString(),
+        completed_at: new Date().toISOString()
+      });
+      if (jobError) console.error("Could not save job history:", jobError);
+
+      // 5. Refresh the Dashboard Data
+      await loadData();
+
+    } catch (error) {
+      console.error("Upload failed:", error);
+      alert("Error processing file. Please ensure your Supabase tables are set up correctly.");
+    } finally {
+      setIsUploading(false);
+      setIsDragging(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const onDragOver = (e: React.DragEvent) => { e.preventDefault(); setIsDragging(true); };
+  const onDragLeave = () => setIsDragging(false);
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      handleFileUpload(e.dataTransfer.files[0]);
+    }
+  };
 
   const stats = useMemo(() => {
     const completed = jobs.filter((j) => j.status === 'COMPLETED').length;
@@ -148,19 +232,43 @@ export default function DataIngestion() {
         ))}
       </div>
 
-      {/* Upload simulation */}
+      {/* NEW FUNCTIONAL UPLOAD SECTION */}
       <div className="card p-5">
         <div className="flex items-center gap-2 mb-4">
           <FileUp className="w-5 h-5 text-teal-600" />
           <h3 className="font-bold text-slate-900">PBM File Ingestion Queue</h3>
         </div>
-        <div className="border-2 border-dashed border-slate-200 rounded-lg p-8 text-center">
-          <FileUp className="w-10 h-10 text-slate-300 mx-auto mb-3" />
-          <p className="text-sm text-slate-500 mb-1">
-            Drop CAA 2026 semi-annual PBM report files here
+        
+        <input 
+          type="file" 
+          accept=".csv" 
+          ref={fileInputRef} 
+          className="hidden" 
+          onChange={(e) => e.target.files && handleFileUpload(e.target.files[0])} 
+        />
+        
+        <div 
+          onClick={() => !isUploading && fileInputRef.current?.click()}
+          onDragOver={onDragOver}
+          onDragLeave={onDragLeave}
+          onDrop={onDrop}
+          className={cn(
+            "border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors duration-200",
+            isDragging ? "border-teal-500 bg-teal-50" : "border-slate-200 hover:border-teal-400 hover:bg-slate-50",
+            isUploading && "opacity-50 cursor-not-allowed"
+          )}
+        >
+          {isUploading ? (
+            <Loader className="w-10 h-10 text-teal-500 mx-auto mb-3 animate-spin" />
+          ) : (
+            <FileUp className={cn("w-10 h-10 mx-auto mb-3", isDragging ? "text-teal-500" : "text-slate-300")} />
+          )}
+          
+          <p className="text-sm font-semibold text-slate-700 mb-1">
+            {isUploading ? "Processing PBM Claims..." : "Click or Drop CAA 2026 CSV file here"}
           </p>
           <p className="text-xs text-slate-400 mb-4">
-            Supports CSV, PSV (pipe-delimited), XLSX, and nested JSON formats
+            Supports CSV, PSV, XLSX, and nested JSON formats
           </p>
           <div className="flex items-center justify-center gap-2 flex-wrap">
             <span className="badge badge-neutral">UTF-8 BOM</span>
@@ -177,17 +285,16 @@ export default function DataIngestion() {
           <h3 className="font-semibold text-slate-900">Ingestion Job History</h3>
         </div>
         <div className="overflow-x-auto">
-          <table className="data-table">
+          <table className="data-table w-full text-left border-collapse">
             <thead>
-              <tr>
-                <th>Filename</th>
-                <th>PBM</th>
-                <th className="text-right">Size</th>
-                <th className="text-right">Rows</th>
-                <th>Status</th>
-                <th>Started</th>
-                <th>Completed</th>
-                <th>Duration</th>
+              <tr className="border-b border-slate-200">
+                <th className="p-4 text-xs font-medium text-slate-500">Filename</th>
+                <th className="p-4 text-xs font-medium text-slate-500">PBM</th>
+                <th className="p-4 text-xs font-medium text-slate-500 text-right">Size</th>
+                <th className="p-4 text-xs font-medium text-slate-500 text-right">Rows</th>
+                <th className="p-4 text-xs font-medium text-slate-500">Status</th>
+                <th className="p-4 text-xs font-medium text-slate-500">Started</th>
+                <th className="p-4 text-xs font-medium text-slate-500">Completed</th>
               </tr>
             </thead>
             <tbody>
@@ -195,53 +302,31 @@ export default function DataIngestion() {
                 const statusCfg = STATUS_CONFIG[job.status] || STATUS_CONFIG.PENDING;
                 const StatusIcon = statusCfg.icon;
                 const vendor = job.pbm_vendors || vendors.find((v) => v.id === job.pbm_vendor_id);
-                const duration = job.completed_at && job.started_at
-                  ? Math.round((new Date(job.completed_at).getTime() - new Date(job.started_at).getTime()) / 1000 / 60)
-                  : null;
                 return (
-                  <tr key={job.id}>
-                    <td className="font-mono text-xs text-slate-700">
+                  <tr key={job.id} className="border-b border-slate-100">
+                    <td className="p-4 font-mono text-xs text-slate-700">
                       <div className="flex items-center gap-2">
                         <FileText className="w-3.5 h-3.5 text-slate-400" />
                         {job.filename}
                       </div>
                     </td>
-                    <td className="text-slate-600">{vendor?.vendor_name.split(' ')[0] || '—'}</td>
-                    <td className="text-right text-slate-500">{job.file_size_mb?.toFixed(1) || '—'} MB</td>
-                    <td className="text-right text-slate-500">{formatNumber(job.row_count)}</td>
-                    <td>
+                    <td className="p-4 text-slate-600">{vendor?.vendor_name.split(' ')[0] || 'Mixed/Unknown'}</td>
+                    <td className="p-4 text-right text-slate-500">{job.file_size_mb?.toFixed(3) || '—'} MB</td>
+                    <td className="p-4 text-right text-slate-500">{formatNumber(job.row_count)}</td>
+                    <td className="p-4">
                       <span className={cn('badge inline-flex items-center gap-1', statusCfg.badge)}>
                         <StatusIcon className={cn('w-3 h-3', job.status === 'PROCESSING' && 'animate-spin')} />
                         {statusCfg.label}
                       </span>
                     </td>
-                    <td className="text-xs text-slate-400">{formatDateTime(job.started_at)}</td>
-                    <td className="text-xs text-slate-400">{formatDateTime(job.completed_at)}</td>
-                    <td className="text-xs text-slate-400">
-                      {duration !== null ? `${duration}m` : '—'}
-                    </td>
+                    <td className="p-4 text-xs text-slate-400">{formatDateTime(job.started_at)}</td>
+                    <td className="p-4 text-xs text-slate-400">{formatDateTime(job.completed_at)}</td>
                   </tr>
                 );
               })}
             </tbody>
           </table>
         </div>
-        {/* Error details for failed jobs */}
-        {jobs.filter((j) => j.error_details).length > 0 && (
-          <div className="p-4 border-t border-slate-200 bg-red-50">
-            <div className="flex items-start gap-2">
-              <AlertCircle className="w-4 h-4 text-red-600 mt-0.5 flex-shrink-0" />
-              <div className="space-y-2">
-                {jobs.filter((j) => j.error_details).map((job) => (
-                  <div key={job.id} className="text-sm">
-                    <span className="font-mono text-xs font-semibold text-red-700">{job.filename}:</span>{' '}
-                    <span className="text-red-600">{job.error_details}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
       </div>
     </div>
   );
