@@ -18,56 +18,75 @@ import { cn } from '@/lib/utils';
 
 export default function DashboardOverview({ onNavigate }: { onNavigate: (view: string) => void }) {
   const [drugs, setDrugs] = useState<Drug[]>([]);
-  const [pricing, setPricing] = useState<DrugPBMPricing[]>([]);
   const [vendors, setVendors] = useState<PBMVendor[]>([]);
   const [anomalies, setAnomalies] = useState<AuditAnomaly[]>([]);
   const [jobs, setJobs] = useState<IngestionJob[]>([]);
+  const [claims, setClaims] = useState<any[]>([]); // ADDED: Live claims state
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     async function loadData() {
-      const [drugsRes, pricingRes, vendorsRes, anomRes, jobsRes] = await Promise.all([
+      const [drugsRes, vendorsRes, anomRes, jobsRes, claimsRes] = await Promise.all([
         supabase.from('drugs').select('*'),
-        supabase.from('drug_pbm_pricing').select('*, pbm_vendors(*)'),
         supabase.from('pbm_vendors').select('*'),
         supabase.from('audit_anomalies').select('*, pbm_vendors(*), drugs(*)').order('detected_at', { ascending: false }).limit(5),
         supabase.from('ingestion_jobs').select('*, pbm_vendors(*)').order('created_at', { ascending: false }),
+        supabase.from('claims').select('*'), // FETCH LIVE CLAIMS
       ]);
+      
       if (drugsRes.data) setDrugs(drugsRes.data);
-      if (pricingRes.data) setPricing(pricingRes.data);
       if (vendorsRes.data) setVendors(vendorsRes.data);
       if (anomRes.data) setAnomalies(anomRes.data);
       if (jobsRes.data) setJobs(jobsRes.data);
+      if (claimsRes.data) setClaims(claimsRes.data);
+      
       setLoading(false);
     }
     loadData();
   }, []);
 
   const stats = useMemo(() => {
-    const totalClaims = pricing.reduce((s, p) => s + p.claim_count, 0);
-    const totalSpend = pricing.reduce((s, p) => s + p.true_net_price * p.claim_count, 0);
+    // Dynamically calculate from the newly ingested claims table
+    const totalClaims = claims.length;
+    const totalSpend = claims.reduce((s, c) => s + Number(c.true_net_price || 0), 0);
+    
     const openViolations = anomalies.filter((a) => a.status === 'OPEN').length;
     const totalExposure = anomalies
       .filter((a) => a.status === 'OPEN')
       .reduce((s, a) => s + a.dollar_amount, 0);
+      
     const completedJobs = jobs.filter((j) => j.status === 'COMPLETED').length;
     const totalRowsIngested = jobs.filter((j) => j.status === 'COMPLETED').reduce((s, j) => s + (j.row_count || 0), 0);
 
-    // Calculate potential savings (max arbitrage per drug * claim count)
-    const drugSavings = drugs.map((drug) => {
-      const drugPricing = pricing.filter((p) => p.drug_id === drug.id);
-      if (drugPricing.length < 2) return 0;
-      const minTNP = Math.min(...drugPricing.map((p) => p.true_net_price));
-      const maxTNP = Math.max(...drugPricing.map((p) => p.true_net_price));
-      const claimsOnExpensive = drugPricing
-        .filter((p) => p.true_net_price > minTNP)
-        .reduce((s, p) => s + p.claim_count, 0);
-      return (maxTNP - minTNP) * claimsOnExpensive;
+    // Calculate potential savings (Arbitrage engine using live claims)
+    const drugNames = [...new Set(claims.map(c => c.drug_name))];
+    let potentialAnnualSavings = 0;
+
+    drugNames.forEach(drugName => {
+      const drugClaims = claims.filter(c => c.drug_name === drugName);
+      const uniquePBMs = [...new Set(drugClaims.map(c => c.pbm_vendor_id))];
+      
+      if (uniquePBMs.length > 1) {
+        const tnpByPBM = uniquePBMs.map(pbmId => {
+          const pbmClaims = drugClaims.filter(c => c.pbm_vendor_id === pbmId);
+          return pbmClaims.reduce((s, c) => s + Number(c.true_net_price || 0), 0) / pbmClaims.length;
+        });
+        
+        const minTNP = Math.min(...tnpByPBM);
+        const maxTNP = Math.max(...tnpByPBM);
+        const expensiveClaims = drugClaims.filter(c => Number(c.true_net_price || 0) > minTNP).length;
+        
+        potentialAnnualSavings += (maxTNP - minTNP) * expensiveClaims;
+      }
     });
-    const potentialAnnualSavings = drugSavings.reduce((s, v) => s + v, 0) * 2; // H1 * 2 for annual
+    
+    potentialAnnualSavings *= 2; // Multiply by 2 for Annual Projection
+
+    // Get unique PBM count straight from the data
+    const uniquePBMCount = new Set(claims.map(c => c.pbm_vendor_id)).size;
 
     return {
-      totalDrugs: drugs.length,
+      totalDrugs: drugNames.length,
       totalClaims,
       totalSpend,
       openViolations,
@@ -75,34 +94,39 @@ export default function DashboardOverview({ onNavigate }: { onNavigate: (view: s
       completedJobs,
       totalRowsIngested,
       potentialAnnualSavings,
-      pbmCount: vendors.length,
+      pbmCount: uniquePBMCount,
     };
-  }, [drugs, pricing, anomalies, jobs, vendors]);
+  }, [claims, anomalies, jobs]);
 
   const topSavingsDrugs = useMemo(() => {
-    return drugs.map((drug) => {
-      const drugPricing = pricing.filter((p) => p.drug_id === drug.id);
-      if (drugPricing.length < 2) return null;
-      const minTNP = Math.min(...drugPricing.map((p) => p.true_net_price));
-      const maxTNP = Math.max(...drugPricing.map((p) => p.true_net_price));
-      const winner = drugPricing.find((p) => p.true_net_price === minTNP);
-      const winnerVendor = vendors.find((v) => v.id === winner?.pbm_vendor_id);
+    // Generate Arbitrage insights from live claims
+    const drugNames = [...new Set(claims.map(c => c.drug_name))];
+    const savings = drugNames.map(drugName => {
+      const drugClaims = claims.filter(c => c.drug_name === drugName);
+      const uniquePBMs = [...new Set(drugClaims.map(c => c.pbm_vendor_id))];
+      
+      if (uniquePBMs.length < 2) return null;
+
+      const pbmStats = uniquePBMs.map(pbmName => {
+        const pbmClaims = drugClaims.filter(c => c.pbm_vendor_id === pbmName);
+        const avgTnp = pbmClaims.reduce((sum, c) => sum + Number(c.true_net_price || 0), 0) / pbmClaims.length;
+        return { pbmName, avgTnp };
+      });
+
+      const minStat = pbmStats.reduce((prev, curr) => prev.avgTnp < curr.avgTnp ? prev : curr);
+      const maxStat = pbmStats.reduce((prev, curr) => prev.avgTnp > curr.avgTnp ? prev : curr);
+
       return {
-        drug,
-        savingsPerFill: maxTNP - minTNP,
-        savingsPct: maxTNP > 0 ? ((maxTNP - minTNP) / maxTNP) * 100 : 0,
-        winnerName: winnerVendor?.vendor_name || '',
+        id: drugName,
+        drug_name: drugName,
+        savingsPerFill: maxStat.avgTnp - minStat.avgTnp,
+        savingsPct: maxStat.avgTnp > 0 ? ((maxStat.avgTnp - minStat.avgTnp) / maxStat.avgTnp) * 100 : 0,
+        winnerName: minStat.pbmName
       };
-    })
-      .filter(Boolean)
-      .sort((a, b) => b!.savingsPerFill - a!.savingsPerFill)
-      .slice(0, 5) as Array<{
-        drug: Drug;
-        savingsPerFill: number;
-        savingsPct: number;
-        winnerName: string;
-      }>;
-  }, [drugs, pricing, vendors]);
+    }).filter(Boolean) as any[];
+
+    return savings.sort((a, b) => b.savingsPerFill - a.savingsPerFill).slice(0, 5);
+  }, [claims]);
 
   if (loading) {
     return (
@@ -197,16 +221,18 @@ export default function DashboardOverview({ onNavigate }: { onNavigate: (view: s
             </button>
           </div>
           <div className="p-4 space-y-3">
-            {topSavingsDrugs.map((item, idx) => (
-              <div key={item.drug.id} className="flex items-center justify-between py-2 border-b border-slate-50 last:border-0">
+            {topSavingsDrugs.length === 0 ? (
+               <div className="text-sm text-slate-500 py-4 text-center">Ingest more overlapping PBM claims to identify arbitrage.</div>
+            ) : topSavingsDrugs.map((item, idx) => (
+              <div key={item.id} className="flex items-center justify-between py-2 border-b border-slate-50 last:border-0">
                 <div className="flex items-center gap-3">
                   <span className="w-6 h-6 rounded-full bg-slate-100 flex items-center justify-center text-xs font-bold text-slate-500">
                     {idx + 1}
                   </span>
                   <div>
-                    <div className="font-medium text-slate-900 text-sm">{item.drug.drug_name.split('(')[0].trim()}</div>
+                    <div className="font-medium text-slate-900 text-sm">{item.drug_name.split('(')[0].trim()}</div>
                     <div className="text-xs text-slate-400">
-                      Best: <span className="font-medium text-teal-600">{item.winnerName.split(' ')[0]}</span>
+                      Best: <span className="font-medium text-teal-600">{item.winnerName}</span>
                       {' · '}<span className="text-emerald-600">{item.savingsPct.toFixed(1)}% savings</span>
                     </div>
                   </div>
@@ -232,7 +258,9 @@ export default function DashboardOverview({ onNavigate }: { onNavigate: (view: s
             </button>
           </div>
           <div className="p-4 space-y-3">
-            {anomalies.slice(0, 5).map((anom) => {
+            {anomalies.length === 0 ? (
+              <div className="text-sm text-slate-500 py-4 text-center">No open ERISA violations detected.</div>
+            ) : anomalies.slice(0, 5).map((anom) => {
               const vendor = anom.pbm_vendors || vendors.find((v) => v.id === anom.pbm_vendor_id);
               const drug = anom.drugs || drugs.find((d) => d.id === anom.drug_id);
               return (
@@ -248,7 +276,7 @@ export default function DashboardOverview({ onNavigate }: { onNavigate: (view: s
                       {anom.anomaly_type.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase())}
                     </div>
                     <div className="text-xs text-slate-400 truncate">
-                      {vendor?.vendor_name.split(' ')[0]} · {drug?.drug_name.split('(')[0].trim()}
+                      {vendor?.vendor_name.split(' ')[0] || 'Unknown'} · {drug?.drug_name.split('(')[0].trim() || 'Unknown'}
                     </div>
                   </div>
                   <div className="text-right flex-shrink-0">
@@ -261,7 +289,7 @@ export default function DashboardOverview({ onNavigate }: { onNavigate: (view: s
         </div>
       </div>
 
-      {/* PBM vendor summary */}
+      {/* PBM vendor summary generated from Claims */}
       <div className="card overflow-hidden">
         <div className="p-4 border-b border-slate-200">
           <h3 className="font-semibold text-slate-900 flex items-center gap-2">
@@ -270,41 +298,38 @@ export default function DashboardOverview({ onNavigate }: { onNavigate: (view: s
           </h3>
         </div>
         <div className="overflow-x-auto">
-          <table className="data-table">
+          <table className="data-table w-full text-left">
             <thead>
-              <tr>
-                <th>Vendor</th>
-                <th>Plan Group</th>
-                <th>Pricing Model</th>
-                <th className="text-right">Drugs Covered</th>
-                <th className="text-right">Claims (H1)</th>
-                <th className="text-right">Total Spend (H1)</th>
-                <th className="text-right">Avg TNP</th>
+              <tr className="border-b border-slate-200">
+                <th className="p-4 text-xs font-medium text-slate-500">Vendor</th>
+                <th className="p-4 text-xs font-medium text-slate-500">Plan Group</th>
+                <th className="p-4 text-xs font-medium text-slate-500">Pricing Model</th>
+                <th className="p-4 text-xs font-medium text-slate-500 text-right">Drugs Covered</th>
+                <th className="p-4 text-xs font-medium text-slate-500 text-right">Claims (H1)</th>
+                <th className="p-4 text-xs font-medium text-slate-500 text-right">Total Spend (H1)</th>
+                <th className="p-4 text-xs font-medium text-slate-500 text-right">Avg TNP</th>
               </tr>
             </thead>
             <tbody>
-              {vendors.map((vendor) => {
-                const vendorPricing = pricing.filter((p) => p.pbm_vendor_id === vendor.id);
-                const drugCount = vendorPricing.length;
-                const claims = vendorPricing.reduce((s, p) => s + p.claim_count, 0);
-                const spend = vendorPricing.reduce((s, p) => s + p.true_net_price * p.claim_count, 0);
-                const avgTNP = drugCount > 0 ? vendorPricing.reduce((s, p) => s + p.true_net_price, 0) / drugCount : 0;
+              {/* Extracting Unique Vendors straight from live claims */}
+              {[...new Set(claims.map(c => c.pbm_vendor_id))].filter(Boolean).map((pbmName) => {
+                const vendorClaims = claims.filter(c => c.pbm_vendor_id === pbmName);
+                const drugCount = new Set(vendorClaims.map(c => c.drug_name)).size;
+                const claimsCount = vendorClaims.length;
+                const spend = vendorClaims.reduce((s, c) => s + Number(c.true_net_price || 0), 0);
+                const avgTNP = claimsCount > 0 ? spend / claimsCount : 0;
+                
                 return (
-                  <tr key={vendor.id}>
-                    <td className="font-medium text-slate-900">{vendor.vendor_name}</td>
-                    <td className="text-slate-600">{vendor.plan_group}</td>
-                    <td>
-                      <span className={cn(
-                        'badge',
-                        vendor.pricing_model === 'PASS_THRU' ? 'badge-success' : 'badge-warning'
-                      )}>
-                        {vendor.pricing_model.replace(/_/g, ' ')}
-                      </span>
+                  <tr key={pbmName as string} className="border-b border-slate-100">
+                    <td className="p-4 font-medium text-slate-900">{pbmName as string}</td>
+                    <td className="p-4 text-slate-600">Commercial</td>
+                    <td className="p-4">
+                      <span className="badge badge-success">PASS THRU</span>
                     </td>
-                    <td className="text-right text-slate-500">{drugCount}</td>
-                    <td className="text-right text-slate-500">{formatNumber(claims)}</td>
-                    <td className="text-right font-medium text-slate-700">{formatCurrencyShort(spend)}</td>
-                    <td className="text-right font-medium text-slate-700">{formatCurrency(avgTNP)}</td>
+                    <td className="p-4 text-right text-slate-500">{drugCount}</td>
+                    <td className="p-4 text-right text-slate-500">{formatNumber(claimsCount)}</td>
+                    <td className="p-4 text-right font-medium text-slate-700">{formatCurrencyShort(spend)}</td>
+                    <td className="p-4 text-right font-medium text-slate-700">{formatCurrency(avgTNP)}</td>
                   </tr>
                 );
               })}
