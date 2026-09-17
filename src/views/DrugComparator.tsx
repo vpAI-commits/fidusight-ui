@@ -10,25 +10,26 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
-import type { Drug, PBMVendor, DrugPBMPricing } from '@/lib/supabase';
-import { formatCurrency, formatNumber } from '@/lib/format';
+import type { Drug, PBMVendor } from '@/lib/supabase';
+import { formatCurrency } from '@/lib/format';
 import { cn } from '@/lib/utils';
 
 interface EnrichedDrugPricing {
   drug: Drug;
-  prices: Record<string, number>; // vendor_code -> tnp_30
+  prices: Record<string, number>; 
   cheapestVendor: PBMVendor | null;
   expensiveVendor: PBMVendor | null;
   lowestPrice: number;
   highestPrice: number;
   arbitragePerFill: number;
   savingsPercentage: number;
+  hasClaims: boolean;
 }
 
 export default function DrugComparator() {
   const [drugs, setDrugs] = useState<Drug[]>([]);
   const [vendors, setVendors] = useState<PBMVendor[]>([]);
-  const [pricingList, setPricingList] = useState<DrugPBMPricing[]>([]);
+  const [claims, setClaims] = useState<any[]>([]);
   const [selectedDrugId, setSelectedDrugId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
@@ -37,19 +38,17 @@ export default function DrugComparator() {
     async function loadComparatorData() {
       try {
         setLoading(true);
-        const [drugsRes, vendorsRes, pricingRes] = await Promise.all([
+        // Fetch drugs, vendors, and LIVE claims data
+        const [drugsRes, vendorsRes, claimsRes] = await Promise.all([
           supabase.from('drugs').select('*').order('drug_name'),
           supabase.from('pbm_vendors').select('*'),
-          supabase.from('drug_pbm_pricing').select('*, pbm_vendors(*), drugs(*)'),
+          supabase.from('claims').select('*'),
         ]);
 
         if (drugsRes.data) setDrugs(drugsRes.data);
         if (vendorsRes.data) setVendors(vendorsRes.data);
-        if (pricingRes.data) setPricingList(pricingRes.data);
+        if (claimsRes.data) setClaims(claimsRes.data);
 
-        if (drugsRes.data && drugsRes.data.length > 0) {
-          setSelectedDrugId(drugsRes.data[0].id);
-        }
       } catch (err) {
         console.error('Failed to load comparator data:', err);
       } finally {
@@ -59,36 +58,37 @@ export default function DrugComparator() {
     loadComparatorData();
   }, []);
 
-  // Standardize pricing per drug across PBMs
+  // Dynamically calculate pricing from the raw claims table
   const processedDrugs = useMemo<EnrichedDrugPricing[]>(() => {
-    return drugs.map((drug) => {
-      const drugPricings = pricingList.filter((p) => p.drug_id === drug.id);
+    const enriched = drugs.map((drug) => {
+      // Find all live claims for this specific drug
+      const drugClaims = claims.filter((c) => c.ndc_11 === drug.ndc_11 || c.drug_name === drug.drug_name);
+      
       const prices: Record<string, number> = {};
-
-      vendors.forEach((vendor) => {
-        const item = drugPricings.find((p) => p.pbm_vendor_id === vendor.id);
-        prices[vendor.vendor_code] = item ? Number(item.true_net_price) : 0;
-      });
-
-      const validPricings = drugPricings.filter((p) => Number(p.true_net_price) > 0);
-      let lowestPrice = 0;
+      let lowestPrice = Infinity;
       let highestPrice = 0;
       let cheapestVendor: PBMVendor | null = null;
       let expensiveVendor: PBMVendor | null = null;
 
-      if (validPricings.length > 0) {
-        const sorted = [...validPricings].sort(
-          (a, b) => Number(a.true_net_price) - Number(b.true_net_price)
-        );
-        lowestPrice = Number(sorted[0].true_net_price);
-        highestPrice = Number(sorted[sorted.length - 1].true_net_price);
-        cheapestVendor =
-          vendors.find((v) => v.id === sorted[0].pbm_vendor_id) || null;
-        expensiveVendor =
-          vendors.find((v) => v.id === sorted[sorted.length - 1].pbm_vendor_id) || null;
-      }
+      vendors.forEach((vendor) => {
+        // The Python agent uses vendor_code (e.g., 'CVS') for the pbm_vendor_id field
+        const vendorClaims = drugClaims.filter((c) => c.pbm_vendor_id === vendor.vendor_code);
+        
+        if (vendorClaims.length > 0) {
+          // Average the True Net Price for this PBM
+          const avgTnp = vendorClaims.reduce((s, c) => s + Number(c.true_net_price || 0), 0) / vendorClaims.length;
+          prices[vendor.vendor_code] = avgTnp;
+          
+          if (avgTnp < lowestPrice) { lowestPrice = avgTnp; cheapestVendor = vendor; }
+          if (avgTnp > highestPrice) { highestPrice = avgTnp; expensiveVendor = vendor; }
+        } else {
+          prices[vendor.vendor_code] = 0;
+        }
+      });
 
-      const arbitragePerFill = highestPrice - lowestPrice;
+      if (lowestPrice === Infinity) lowestPrice = 0;
+
+      const arbitragePerFill = highestPrice > 0 ? highestPrice - lowestPrice : 0;
       const savingsPercentage = highestPrice > 0 ? (arbitragePerFill / highestPrice) * 100 : 0;
 
       return {
@@ -100,9 +100,22 @@ export default function DrugComparator() {
         highestPrice,
         arbitragePerFill,
         savingsPercentage,
+        hasClaims: drugClaims.length > 0
       };
     });
-  }, [drugs, vendors, pricingList]);
+
+    // Only show drugs in the UI that actually have uploaded claims
+    return enriched.filter(d => d.hasClaims);
+  }, [drugs, vendors, claims]);
+
+  // Ensure a drug is selected if data exists
+  useEffect(() => {
+    if (processedDrugs.length > 0 && !selectedDrugId) {
+      setSelectedDrugId(processedDrugs[0].drug.id);
+    } else if (processedDrugs.length === 0) {
+      setSelectedDrugId(null);
+    }
+  }, [processedDrugs, selectedDrugId]);
 
   // Filter for search bar
   const filteredDrugs = useMemo(() => {
@@ -116,13 +129,8 @@ export default function DrugComparator() {
     );
   }, [processedDrugs, searchQuery]);
 
-  // Current selected drug record
   const currentSelection = useMemo(() => {
-    return (
-      processedDrugs.find((item) => item.drug.id === selectedDrugId) ||
-      processedDrugs[0] ||
-      null
-    );
+    return processedDrugs.find((item) => item.drug.id === selectedDrugId) || null;
   }, [processedDrugs, selectedDrugId]);
 
   if (loading) {
@@ -130,15 +138,28 @@ export default function DrugComparator() {
       <div className="flex items-center justify-center h-full min-h-[400px]">
         <div className="text-slate-400 text-sm flex items-center gap-2">
           <Loader2 className="w-5 h-5 animate-spin text-teal-600" />
-          <span>Synchronizing cross-PBM True Net Prices...</span>
+          <span>Synchronizing live claims data...</span>
         </div>
+      </div>
+    );
+  }
+
+  if (processedDrugs.length === 0) {
+    return (
+      <div className="p-6 max-w-7xl mx-auto h-[60vh] flex flex-col items-center justify-center text-center">
+        <div className="w-16 h-16 bg-slate-100 rounded-full flex items-center justify-center mb-4">
+          <Pill className="w-8 h-8 text-slate-300" />
+        </div>
+        <h2 className="text-xl font-bold text-slate-900 mb-2">No Claims Data Available</h2>
+        <p className="text-slate-500 max-w-md">
+          The comparator engine is waiting for data. Head over to the <b>Data Ingestion</b> tab and upload a PBM claims file to activate cross-PBM pricing analysis.
+        </p>
       </div>
     );
   }
 
   return (
     <div className="p-6 space-y-6 max-w-7xl mx-auto animate-fade-in">
-      {/* Search Input */}
       <div className="relative w-full max-w-lg">
         <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
         <input
@@ -150,7 +171,6 @@ export default function DrugComparator() {
         />
       </div>
 
-      {/* Drug Selection Pills Cloud */}
       <div className="flex flex-wrap gap-2.5">
         {filteredDrugs.map(({ drug }) => {
           const isSelected = selectedDrugId === drug.id;
@@ -165,12 +185,7 @@ export default function DrugComparator() {
                   : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300'
               )}
             >
-              <Pill
-                className={cn(
-                  'w-3.5 h-3.5',
-                  isSelected ? 'text-teal-600' : 'text-slate-400'
-                )}
-              />
+              <Pill className={cn('w-3.5 h-3.5', isSelected ? 'text-teal-600' : 'text-slate-400')} />
               <span>{drug.drug_name}</span>
               {drug.is_specialty && (
                 <span className="bg-sky-100 text-sky-700 text-[10px] font-semibold px-2 py-0.5 rounded-full">
@@ -184,7 +199,6 @@ export default function DrugComparator() {
 
       {currentSelection && (
         <>
-          {/* Active Drug Header */}
           <div className="card p-5 bg-white flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div>
               <h2 className="text-xl font-bold text-slate-900 tracking-tight">
@@ -215,21 +229,17 @@ export default function DrugComparator() {
             </div>
           </div>
 
-          {/* Cross-PBM Price Cards */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
             {vendors.map((vendor) => {
               const price = currentSelection.prices[vendor.vendor_code] || 0;
-              const isLowest =
-                price > 0 && price === currentSelection.lowestPrice;
+              const isLowest = price > 0 && price === currentSelection.lowestPrice;
 
               return (
                 <div
                   key={vendor.id}
                   className={cn(
                     'card relative p-5 bg-white transition-all',
-                    isLowest
-                      ? 'border-teal-500 ring-1 ring-teal-500/20 shadow-sm'
-                      : 'border-slate-200'
+                    isLowest ? 'border-teal-500 ring-1 ring-teal-500/20 shadow-sm' : 'border-slate-200'
                   )}
                 >
                   {isLowest && (
@@ -247,9 +257,7 @@ export default function DrugComparator() {
                       <h4 className="font-semibold text-slate-900 text-sm leading-tight">
                         {vendor.vendor_name}
                       </h4>
-                      <p className="text-xs text-slate-400 mt-0.5">
-                        {vendor.plan_group}
-                      </p>
+                      <p className="text-xs text-slate-400 mt-0.5">{vendor.plan_group}</p>
                     </div>
                   </div>
 
@@ -257,16 +265,13 @@ export default function DrugComparator() {
                     <div className="text-3xl font-bold text-slate-900 tracking-tight">
                       {formatCurrency(price)}
                     </div>
-                    <div className="text-xs text-slate-400 mt-1">
-                      True Net Price (TNP-30)
-                    </div>
+                    <div className="text-xs text-slate-400 mt-1">True Net Price (Average)</div>
                   </div>
                 </div>
               );
             })}
           </div>
 
-          {/* Arbitrage Summary Card */}
           <div className="card p-5 bg-gradient-to-r from-teal-50/70 to-cyan-50/50 border-teal-200/80">
             <div className="flex items-center gap-2 mb-4">
               <Bookmark className="w-4 h-4 text-teal-700" />
@@ -274,73 +279,41 @@ export default function DrugComparator() {
             </div>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <div>
-                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">
-                  Cheapest PBM
-                </div>
-                <div className="font-bold text-teal-700 text-sm">
-                  {currentSelection.cheapestVendor?.vendor_name || 'N/A'}
-                </div>
+                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">Cheapest PBM</div>
+                <div className="font-bold text-teal-700 text-sm">{currentSelection.cheapestVendor?.vendor_name || 'N/A'}</div>
               </div>
               <div>
-                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">
-                  Most Expensive
-                </div>
-                <div className="font-bold text-slate-800 text-sm">
-                  {currentSelection.expensiveVendor?.vendor_name || 'N/A'}
-                </div>
+                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">Most Expensive</div>
+                <div className="font-bold text-slate-800 text-sm">{currentSelection.expensiveVendor?.vendor_name || 'N/A'}</div>
               </div>
               <div>
-                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">
-                  Max Savings / Fill
-                </div>
-                <div className="font-bold text-emerald-600 text-sm">
-                  {formatCurrency(currentSelection.arbitragePerFill)}
-                </div>
+                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">Max Savings / Fill</div>
+                <div className="font-bold text-emerald-600 text-sm">{formatCurrency(currentSelection.arbitragePerFill)}</div>
               </div>
               <div>
-                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">
-                  Max Savings %
-                </div>
-                <div className="font-bold text-emerald-600 text-sm">
-                  {currentSelection.savingsPercentage.toFixed(1)}%
-                </div>
+                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">Max Savings %</div>
+                <div className="font-bold text-emerald-600 text-sm">{currentSelection.savingsPercentage.toFixed(1)}%</div>
               </div>
             </div>
           </div>
 
-          {/* All Drugs Cross-PBM Table */}
           <div className="card overflow-hidden">
             <div className="p-4 border-b border-slate-200 bg-slate-50/80 flex items-center gap-2">
               <Info className="w-4 h-4 text-slate-400" />
               <h3 className="font-semibold text-slate-800 text-xs uppercase tracking-wider">
-                All Drugs — Cross-PBM TNP Comparison (Standardized 30-Day)
+                Uploaded Drugs — Cross-PBM Live Averages
               </h3>
             </div>
             <div className="overflow-x-auto">
               <table className="data-table w-full text-left">
                 <thead>
                   <tr className="border-b border-slate-200 bg-white">
-                    <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                      Drug Name & Dosage
-                    </th>
-                    <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                      Therapeutic Class
-                    </th>
-                    <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right">
-                      CVS TNP
-                    </th>
-                    <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right">
-                      Navitus TNP
-                    </th>
-                    <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right">
-                      OptumRx TNP
-                    </th>
-                    <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider text-center">
-                      Best Plan
-                    </th>
-                    <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right">
-                      Arbitrage / Fill
-                    </th>
+                    <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider">Drug Name & Dosage</th>
+                    <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right">CVS TNP</th>
+                    <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right">Navitus TNP</th>
+                    <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right">OptumRx TNP</th>
+                    <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider text-center">Best Plan</th>
+                    <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right">Arbitrage / Fill</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-sm">
@@ -352,47 +325,16 @@ export default function DrugComparator() {
                       <tr
                         key={item.drug.id}
                         onClick={() => setSelectedDrugId(item.drug.id)}
-                        className={cn(
-                          'cursor-pointer transition-colors hover:bg-slate-50/80',
-                          isSelected && 'bg-teal-50/40'
-                        )}
+                        className={cn('cursor-pointer transition-colors hover:bg-slate-50/80', isSelected && 'bg-teal-50/40')}
                       >
-                        <td className="p-4 font-semibold text-slate-900">
-                          {item.drug.drug_name}
-                        </td>
-                        <td className="p-4">
-                          <span className="inline-block bg-slate-100 text-slate-600 px-2.5 py-1 rounded-full text-xs font-medium">
-                            {item.drug.therapeutic_class}
-                          </span>
-                        </td>
-                        <td
-                          className={cn(
-                            'p-4 text-right font-medium',
-                            item.prices['CVS'] === item.lowestPrice
-                              ? 'text-emerald-600 font-bold'
-                              : 'text-slate-600'
-                          )}
-                        >
+                        <td className="p-4 font-semibold text-slate-900">{item.drug.drug_name}</td>
+                        <td className={cn('p-4 text-right font-medium', item.prices['CVS'] === item.lowestPrice && item.prices['CVS'] > 0 ? 'text-emerald-600 font-bold' : 'text-slate-600')}>
                           {formatCurrency(item.prices['CVS'])}
                         </td>
-                        <td
-                          className={cn(
-                            'p-4 text-right font-medium',
-                            item.prices['NAVITUS'] === item.lowestPrice
-                              ? 'text-emerald-600 font-bold'
-                              : 'text-slate-600'
-                          )}
-                        >
+                        <td className={cn('p-4 text-right font-medium', item.prices['NAVITUS'] === item.lowestPrice && item.prices['NAVITUS'] > 0 ? 'text-emerald-600 font-bold' : 'text-slate-600')}>
                           {formatCurrency(item.prices['NAVITUS'])}
                         </td>
-                        <td
-                          className={cn(
-                            'p-4 text-right font-medium',
-                            item.prices['OPTUMRX'] === item.lowestPrice
-                              ? 'text-emerald-600 font-bold'
-                              : 'text-slate-600'
-                          )}
-                        >
+                        <td className={cn('p-4 text-right font-medium', item.prices['OPTUMRX'] === item.lowestPrice && item.prices['OPTUMRX'] > 0 ? 'text-emerald-600 font-bold' : 'text-slate-600')}>
                           {formatCurrency(item.prices['OPTUMRX'])}
                         </td>
                         <td className="p-4 text-center">
@@ -402,12 +344,8 @@ export default function DrugComparator() {
                         </td>
                         <td className="p-4 text-right">
                           <div className="flex items-center justify-end gap-1.5">
-                            <span className="font-semibold text-emerald-600">
-                              -{formatCurrency(item.arbitragePerFill)}
-                            </span>
-                            {isHighVariance && (
-                              <AlertTriangle className="w-3.5 h-3.5 text-red-500 flex-shrink-0" />
-                            )}
+                            <span className="font-semibold text-emerald-600">-{formatCurrency(item.arbitragePerFill)}</span>
+                            {isHighVariance && <AlertTriangle className="w-3.5 h-3.5 text-red-500 flex-shrink-0" />}
                           </div>
                         </td>
                       </tr>
