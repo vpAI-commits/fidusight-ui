@@ -14,8 +14,19 @@ import type { Drug } from '@/lib/supabase';
 import { formatCurrency } from '@/lib/format';
 import { cn } from '@/lib/utils';
 
+// --- REUSABLE TOOLTIP COMPONENT ---
+const InfoTooltip = ({ text }: { text: string }) => (
+  <div className="group relative inline-flex items-center ml-1.5 cursor-help align-middle">
+    <Info className="w-3.5 h-3.5 text-slate-400 hover:text-teal-500 transition-colors" />
+    <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block w-56 p-2.5 bg-slate-800 text-white text-xs rounded-lg shadow-xl z-50 font-normal leading-relaxed text-left normal-case tracking-normal">
+      {text}
+      <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-slate-800"></div>
+    </div>
+  </div>
+);
+
 interface PbmPlanContract {
-  id: string; // Composite key: PBM::Plan
+  id: string; 
   pbm: string;
   plan: string;
 }
@@ -62,7 +73,6 @@ export default function DrugComparator() {
     loadComparatorData();
   }, []);
 
-  // 1. Extract Unique PBM + Plan combinations
   const contracts = useMemo<PbmPlanContract[]>(() => {
     const contractMap = new Map<string, PbmPlanContract>();
     claims.forEach((c) => {
@@ -76,7 +86,6 @@ export default function DrugComparator() {
     return Array.from(contractMap.values()).sort((a, b) => a.pbm.localeCompare(b.pbm) || a.plan.localeCompare(b.plan));
   }, [claims]);
 
-  // Group contracts by PBM for the matrix table headers
   const pbmGroups = useMemo(() => {
     const groups: Record<string, PbmPlanContract[]> = {};
     contracts.forEach(c => {
@@ -86,7 +95,6 @@ export default function DrugComparator() {
     return groups;
   }, [contracts]);
 
-  // 2. Calculate TNP across all contracts
   const processedDrugs = useMemo<EnrichedDrugPricing[]>(() => {
     const enriched = drugs.map((drug) => {
       const drugClaims = claims.filter((c) => c.ndc_11 === drug.ndc_11 || c.drug_name === drug.drug_name);
@@ -134,7 +142,6 @@ export default function DrugComparator() {
     return enriched.filter(d => d.hasClaims);
   }, [drugs, contracts, claims]);
 
-  // 3. Selection Auto-Defaults
   useEffect(() => {
     if (processedDrugs.length > 0 && !selectedDrugId) {
       setSelectedDrugId(processedDrugs[0].drug.id);
@@ -187,7 +194,6 @@ export default function DrugComparator() {
     );
   }
 
-  // Calculate Head-to-Head Arbitrage for the selected drug
   const priceA = currentSelection ? (currentSelection.prices[compareA] || 0) : 0;
   const priceB = currentSelection ? (currentSelection.prices[compareB] || 0) : 0;
   const headToHeadDiff = Math.abs(priceA - priceB);
@@ -195,7 +201,6 @@ export default function DrugComparator() {
 
   return (
     <div className="p-6 space-y-6 max-w-[1400px] mx-auto animate-fade-in">
-      {/* Search & Pill Cloud */}
       <div className="relative w-full max-w-lg">
         <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
         <input
@@ -232,7 +237,6 @@ export default function DrugComparator() {
 
       {currentSelection && (
         <>
-          {/* Active Drug Header */}
           <div className="card p-5 bg-white flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div>
               <h2 className="text-xl font-bold text-slate-900 tracking-tight">
@@ -249,7 +253,10 @@ export default function DrugComparator() {
               </div>
             </div>
             <div className="text-left md:text-right border-t md:border-t-0 pt-3 md:pt-0 border-slate-100">
-              <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">NADAC Benchmark</div>
+              <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                NADAC Benchmark
+                <InfoTooltip text="National Average Drug Acquisition Cost. The approximate wholesale price pharmacies pay to acquire the drug." />
+              </div>
               <div className="text-2xl font-bold text-slate-900 mt-0.5">
                 {formatCurrency(currentSelection.drug.nadac_benchmark_unit)}
               </div>
@@ -257,15 +264,16 @@ export default function DrugComparator() {
             </div>
           </div>
 
-          {/* HEAD-TO-HEAD SIDE-BY-SIDE COMPARATOR */}
           <div className="card p-6 bg-slate-50/50 border-slate-200">
             <div className="flex items-center gap-2 mb-6">
               <ArrowRightLeft className="w-4 h-4 text-teal-600" />
-              <h3 className="font-bold text-slate-900 text-sm uppercase tracking-wider">Head-to-Head Contract Comparison</h3>
+              <h3 className="font-bold text-slate-900 text-sm uppercase tracking-wider">
+                Head-to-Head Contract Comparison
+                <InfoTooltip text="Select any two PBM/Plan contracts to instantly compare their pricing performance for the selected drug." />
+              </h3>
             </div>
             
             <div className="grid grid-cols-1 lg:grid-cols-[1fr_auto_1fr] gap-8 items-center">
-              {/* Left Side: Contract A */}
               <div className={cn("p-5 rounded-xl border bg-white transition-colors", winner === 'A' ? "border-emerald-400 ring-1 ring-emerald-400/20" : "border-slate-200")}>
                 <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Baseline Contract</label>
                 <select 
@@ -280,14 +288,16 @@ export default function DrugComparator() {
                 </select>
                 <div className="flex justify-between items-end">
                   <div>
-                    <div className="text-xs text-slate-400 mb-1">True Net Price</div>
+                    <div className="text-xs text-slate-400 mb-1">
+                      True Net Price
+                      <InfoTooltip text="The actual final cost to the plan sponsor (Pharmacy Paid - Rebates)." />
+                    </div>
                     <div className="text-3xl font-bold text-slate-900">{formatCurrency(priceA)}</div>
                   </div>
                   {winner === 'A' && priceA > 0 && <span className="bg-emerald-100 text-emerald-700 text-xs font-bold px-3 py-1 rounded-full mb-1">Lowest Cost</span>}
                 </div>
               </div>
 
-              {/* Center VS Indicator */}
               <div className="flex flex-col items-center justify-center">
                 <div className="w-12 h-12 rounded-full bg-white border border-slate-200 shadow-sm flex items-center justify-center font-black text-slate-400 text-sm z-10">VS</div>
                 {headToHeadDiff > 0 && priceA > 0 && priceB > 0 && (
@@ -298,7 +308,6 @@ export default function DrugComparator() {
                 )}
               </div>
 
-              {/* Right Side: Contract B */}
               <div className={cn("p-5 rounded-xl border bg-white transition-colors", winner === 'B' ? "border-emerald-400 ring-1 ring-emerald-400/20" : "border-slate-200")}>
                 <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Comparison Contract</label>
                 <select 
@@ -313,7 +322,10 @@ export default function DrugComparator() {
                 </select>
                 <div className="flex justify-between items-end">
                   <div>
-                    <div className="text-xs text-slate-400 mb-1">True Net Price</div>
+                    <div className="text-xs text-slate-400 mb-1">
+                      True Net Price
+                      <InfoTooltip text="The actual final cost to the plan sponsor (Pharmacy Paid - Rebates)." />
+                    </div>
                     <div className="text-3xl font-bold text-slate-900">{formatCurrency(priceB)}</div>
                   </div>
                   {winner === 'B' && priceB > 0 && <span className="bg-emerald-100 text-emerald-700 text-xs font-bold px-3 py-1 rounded-full mb-1">Lowest Cost</span>}
@@ -322,7 +334,6 @@ export default function DrugComparator() {
             </div>
           </div>
 
-          {/* GLOBAL ARBITRAGE SUMMARY */}
           <div className="card p-5 bg-gradient-to-r from-teal-50/70 to-cyan-50/50 border-teal-200/80">
             <div className="flex items-center gap-2 mb-4">
               <Bookmark className="w-4 h-4 text-teal-700" />
@@ -330,29 +341,40 @@ export default function DrugComparator() {
             </div>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <div>
-                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">Cheapest Contract</div>
+                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">
+                  Cheapest Contract
+                  <InfoTooltip text="The PBM and Plan combination offering the absolute lowest True Net Price for this drug." />
+                </div>
                 <div className="font-bold text-teal-700 text-sm">
                   {currentSelection.cheapestContract ? `${currentSelection.cheapestContract.pbm} (${currentSelection.cheapestContract.plan})` : 'N/A'}
                 </div>
               </div>
               <div>
-                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">Most Expensive</div>
+                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">
+                  Most Expensive
+                  <InfoTooltip text="The PBM and Plan combination charging the highest True Net Price." />
+                </div>
                 <div className="font-bold text-slate-800 text-sm">
                   {currentSelection.expensiveContract ? `${currentSelection.expensiveContract.pbm} (${currentSelection.expensiveContract.plan})` : 'N/A'}
                 </div>
               </div>
               <div>
-                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">Max Savings / Fill</div>
+                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">
+                  Max Savings / Fill
+                  <InfoTooltip text="The dollar difference between the most expensive and cheapest contract per prescription fill." />
+                </div>
                 <div className="font-bold text-emerald-600 text-sm">{formatCurrency(currentSelection.maxArbitrage)}</div>
               </div>
               <div>
-                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">Max Savings %</div>
+                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">
+                  Max Savings %
+                  <InfoTooltip text="The percentage reduction in cost if routing from the most expensive contract to the cheapest." />
+                </div>
                 <div className="font-bold text-emerald-600 text-sm">{currentSelection.savingsPercentage.toFixed(1)}%</div>
               </div>
             </div>
           </div>
 
-          {/* HIERARCHICAL MATRIX TABLE */}
           <div className="card overflow-hidden">
             <div className="p-4 border-b border-slate-200 bg-slate-50/80 flex items-center gap-2">
               <Info className="w-4 h-4 text-slate-400" />
@@ -363,7 +385,6 @@ export default function DrugComparator() {
             <div className="overflow-x-auto">
               <table className="data-table w-full text-left border-collapse">
                 <thead>
-                  {/* Super Header: PBMs */}
                   <tr className="bg-white">
                     <th rowSpan={2} className="p-4 align-bottom text-xs font-bold text-slate-700 uppercase tracking-wider border-b-2 border-slate-200 min-w-[250px]">
                       Drug Name & Dosage
@@ -381,12 +402,13 @@ export default function DrugComparator() {
                     ))}
                     <th rowSpan={2} className="p-4 align-bottom text-xs font-bold text-slate-500 uppercase tracking-wider text-center border-l border-b-2 border-slate-200">
                       Best Contract
+                      <InfoTooltip text="The contract with the lowest True Net Price for this row." />
                     </th>
                     <th rowSpan={2} className="p-4 align-bottom text-xs font-bold text-slate-500 uppercase tracking-wider text-right border-b-2 border-slate-200">
                       Max Arbitrage
+                      <InfoTooltip text="Financial penalty per fill if using the most expensive contract instead of the cheapest." />
                     </th>
                   </tr>
-                  {/* Sub Header: Health Plans */}
                   <tr className="bg-white">
                     {Object.values(pbmGroups).flat().map((contract) => (
                       <th 
@@ -394,6 +416,7 @@ export default function DrugComparator() {
                         className="p-3 text-xs font-semibold text-slate-500 text-right border-l border-b-2 border-slate-200 bg-slate-50/50"
                       >
                         {contract.plan}
+                        <InfoTooltip text={`True Net Price for the ${contract.plan} plan under ${contract.pbm}.`} />
                       </th>
                     ))}
                   </tr>
@@ -411,7 +434,6 @@ export default function DrugComparator() {
                       >
                         <td className="p-4 font-semibold text-slate-900 border-r border-slate-50">{item.drug.drug_name}</td>
                         
-                        {/* Pricing Cells aligned with grouped headers */}
                         {Object.values(pbmGroups).flat().map((contract) => {
                           const contractPrice = item.prices[contract.id] || 0;
                           const isContractLowest = contractPrice > 0 && contractPrice === item.lowestPrice;
