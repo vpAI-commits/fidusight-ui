@@ -92,3 +92,13 @@ export interface AuditLogEntry {
   hash_current: string | null;
   created_at: string;
 }
+
+export interface PBMPlan {
+  id: string;
+  pbm_vendor_id: string;
+  plan_code: string;
+  plan_name: string;
+  plan_type: string;
+  created_at: string;
+  pbm_vendors?: PBMVendor;
+}
