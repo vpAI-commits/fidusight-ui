@@ -14,21 +14,17 @@ import type { Drug } from '@/lib/supabase';
 import { formatCurrency } from '@/lib/format';
 import { cn } from '@/lib/utils';
 
-// Local interface for Plans since we just added it to the DB
-interface PBMPlan {
-  id: string;
-  pbm_vendor_id: string;
-  plan_code: string;
-  plan_name: string;
-  plan_type: string;
-  pbm_vendors?: { vendor_name: string };
+interface PbmPlanContract {
+  id: string; // Composite key: PBM + Plan
+  pbm: string;
+  plan: string;
 }
 
 interface EnrichedDrugPricing {
   drug: Drug;
   prices: Record<string, number>; 
-  cheapestPlan: PBMPlan | null;
-  expensivePlan: PBMPlan | null;
+  cheapestContract: PbmPlanContract | null;
+  expensiveContract: PbmPlanContract | null;
   lowestPrice: number;
   highestPrice: number;
   arbitragePerFill: number;
@@ -38,7 +34,6 @@ interface EnrichedDrugPricing {
 
 export default function DrugComparator() {
   const [drugs, setDrugs] = useState<Drug[]>([]);
-  const [plans, setPlans] = useState<PBMPlan[]>([]);
   const [claims, setClaims] = useState<any[]>([]);
   const [selectedDrugId, setSelectedDrugId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -48,15 +43,13 @@ export default function DrugComparator() {
     async function loadComparatorData() {
       try {
         setLoading(true);
-        // Fetch drugs, health plans, and LIVE claims data
-        const [drugsRes, plansRes, claimsRes] = await Promise.all([
+        // Fetch only drugs and live claims - bypass rigid master tables
+        const [drugsRes, claimsRes] = await Promise.all([
           supabase.from('drugs').select('*').order('drug_name'),
-          supabase.from('pbm_plans').select('*, pbm_vendors(vendor_name)'),
           supabase.from('claims').select('*'),
         ]);
 
         if (drugsRes.data) setDrugs(drugsRes.data);
-        if (plansRes.data) setPlans(plansRes.data);
         if (claimsRes.data) setClaims(claimsRes.data);
 
       } catch (err) {
@@ -68,31 +61,46 @@ export default function DrugComparator() {
     loadComparatorData();
   }, []);
 
-  // Dynamically calculate pricing grouped by HEALTH PLAN from the raw claims table
+  // 1. Dynamically extract unique PBM + Plan combinations from the live claims
+  const contracts = useMemo<PbmPlanContract[]>(() => {
+    const contractMap = new Map<string, PbmPlanContract>();
+    claims.forEach((c) => {
+      const pbm = c.pbm_vendor_id || 'Unknown PBM';
+      const plan = c.pbm_plan_id || 'Default Plan';
+      const id = `${pbm}::${plan}`;
+      
+      if (!contractMap.has(id)) {
+        contractMap.set(id, { id, pbm, plan });
+      }
+    });
+    return Array.from(contractMap.values()).sort((a, b) => a.pbm.localeCompare(b.pbm));
+  }, [claims]);
+
+  // 2. Calculate TNP for each drug across all extracted PBM-Plan contracts
   const processedDrugs = useMemo<EnrichedDrugPricing[]>(() => {
     const enriched = drugs.map((drug) => {
-      // Find all live claims for this specific drug
       const drugClaims = claims.filter((c) => c.ndc_11 === drug.ndc_11 || c.drug_name === drug.drug_name);
       
       const prices: Record<string, number> = {};
       let lowestPrice = Infinity;
       let highestPrice = 0;
-      let cheapestPlan: PBMPlan | null = null;
-      let expensivePlan: PBMPlan | null = null;
+      let cheapestContract: PbmPlanContract | null = null;
+      let expensiveContract: PbmPlanContract | null = null;
 
-      plans.forEach((plan) => {
-        // Match claims to the specific plan_code
-        const planClaims = drugClaims.filter((c) => c.pbm_plan_id === plan.plan_code);
+      contracts.forEach((contract) => {
+        const contractClaims = drugClaims.filter((c) => 
+          (c.pbm_vendor_id || 'Unknown PBM') === contract.pbm && 
+          (c.pbm_plan_id || 'Default Plan') === contract.plan
+        );
         
-        if (planClaims.length > 0) {
-          // Average the True Net Price for this specific Plan
-          const avgTnp = planClaims.reduce((s, c) => s + Number(c.true_net_price || 0), 0) / planClaims.length;
-          prices[plan.plan_code] = avgTnp;
+        if (contractClaims.length > 0) {
+          const avgTnp = contractClaims.reduce((s, c) => s + Number(c.true_net_price || 0), 0) / contractClaims.length;
+          prices[contract.id] = avgTnp;
           
-          if (avgTnp < lowestPrice) { lowestPrice = avgTnp; cheapestPlan = plan; }
-          if (avgTnp > highestPrice) { highestPrice = avgTnp; expensivePlan = plan; }
+          if (avgTnp < lowestPrice) { lowestPrice = avgTnp; cheapestContract = contract; }
+          if (avgTnp > highestPrice) { highestPrice = avgTnp; expensiveContract = contract; }
         } else {
-          prices[plan.plan_code] = 0;
+          prices[contract.id] = 0;
         }
       });
 
@@ -104,8 +112,8 @@ export default function DrugComparator() {
       return {
         drug,
         prices,
-        cheapestPlan,
-        expensivePlan,
+        cheapestContract,
+        expensiveContract,
         lowestPrice,
         highestPrice,
         arbitragePerFill,
@@ -114,11 +122,11 @@ export default function DrugComparator() {
       };
     });
 
-    // Only show drugs in the UI that actually have uploaded claims
+    // Only show drugs that exist in the claims file
     return enriched.filter(d => d.hasClaims);
-  }, [drugs, plans, claims]);
+  }, [drugs, contracts, claims]);
 
-  // Ensure a drug is selected if data exists
+  // 3. Selection & Filtering logic
   useEffect(() => {
     if (processedDrugs.length > 0 && !selectedDrugId) {
       setSelectedDrugId(processedDrugs[0].drug.id);
@@ -127,7 +135,6 @@ export default function DrugComparator() {
     }
   }, [processedDrugs, selectedDrugId]);
 
-  // Filter for search bar
   const filteredDrugs = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     if (!q) return processedDrugs;
@@ -148,7 +155,7 @@ export default function DrugComparator() {
       <div className="flex items-center justify-center h-full min-h-[400px]">
         <div className="text-slate-400 text-sm flex items-center gap-2">
           <Loader2 className="w-5 h-5 animate-spin text-teal-600" />
-          <span>Synchronizing live plan-level claims data...</span>
+          <span>Synchronizing live contract-level claims data...</span>
         </div>
       </div>
     );
@@ -162,7 +169,7 @@ export default function DrugComparator() {
         </div>
         <h2 className="text-xl font-bold text-slate-900 mb-2">No Claims Data Available</h2>
         <p className="text-slate-500 max-w-md">
-          The comparator engine is waiting for data. Head over to the <b>Data Ingestion</b> tab and upload a PBM claims file to activate cross-plan pricing analysis.
+          The comparator engine is waiting for data. Head over to the <b>Data Ingestion</b> tab and upload a PBM claims file to activate cross-contract pricing analysis.
         </p>
       </div>
     );
@@ -239,15 +246,15 @@ export default function DrugComparator() {
             </div>
           </div>
 
-          {/* DYNAMIC PLAN CARDS */}
+          {/* DYNAMIC CONTRACT CARDS (PBM + Plan) */}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5">
-            {plans.map((plan) => {
-              const price = currentSelection.prices[plan.plan_code] || 0;
+            {contracts.map((contract) => {
+              const price = currentSelection.prices[contract.id] || 0;
               const isLowest = price > 0 && price === currentSelection.lowestPrice;
 
               return (
                 <div
-                  key={plan.id}
+                  key={contract.id}
                   className={cn(
                     'card relative p-5 bg-white transition-all',
                     isLowest ? 'border-teal-500 ring-1 ring-teal-500/20 shadow-sm' : 'border-slate-200'
@@ -266,10 +273,10 @@ export default function DrugComparator() {
                     </div>
                     <div>
                       <h4 className="font-bold text-slate-900 text-sm leading-tight">
-                        {plan.plan_code}
+                        {contract.pbm}
                       </h4>
-                      <p className="text-xs text-slate-500 mt-0.5 truncate max-w-[120px]" title={plan.plan_name}>
-                        {plan.pbm_vendors?.vendor_name || 'Vendor'} - {plan.plan_type}
+                      <p className="text-xs text-slate-500 mt-0.5 font-mono">
+                        Plan: {contract.plan}
                       </p>
                     </div>
                   </div>
@@ -292,12 +299,16 @@ export default function DrugComparator() {
             </div>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <div>
-                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">Cheapest Plan</div>
-                <div className="font-bold text-teal-700 text-sm">{currentSelection.cheapestPlan?.plan_code || 'N/A'}</div>
+                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">Cheapest PBM Contract</div>
+                <div className="font-bold text-teal-700 text-sm">
+                  {currentSelection.cheapestContract ? `${currentSelection.cheapestContract.pbm} (${currentSelection.cheapestContract.plan})` : 'N/A'}
+                </div>
               </div>
               <div>
-                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">Most Expensive Plan</div>
-                <div className="font-bold text-slate-800 text-sm">{currentSelection.expensivePlan?.plan_code || 'N/A'}</div>
+                <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">Most Expensive</div>
+                <div className="font-bold text-slate-800 text-sm">
+                  {currentSelection.expensiveContract ? `${currentSelection.expensiveContract.pbm} (${currentSelection.expensiveContract.plan})` : 'N/A'}
+                </div>
               </div>
               <div>
                 <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wider mb-1">Max Savings / Fill</div>
@@ -314,7 +325,7 @@ export default function DrugComparator() {
             <div className="p-4 border-b border-slate-200 bg-slate-50/80 flex items-center gap-2">
               <Info className="w-4 h-4 text-slate-400" />
               <h3 className="font-semibold text-slate-800 text-xs uppercase tracking-wider">
-                Uploaded Drugs — Cross-Plan Live Averages
+                Uploaded Drugs — Contract Level Averages
               </h3>
             </div>
             <div className="overflow-x-auto">
@@ -322,13 +333,13 @@ export default function DrugComparator() {
                 <thead>
                   <tr className="border-b border-slate-200 bg-white">
                     <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider">Drug Name & Dosage</th>
-                    {/* Dynamically generate column headers for every plan */}
-                    {plans.map((plan) => (
-                      <th key={plan.id} className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right">
-                        {plan.plan_code}
+                    {/* Dynamically generate column headers for every PBM-Plan combination */}
+                    {contracts.map((contract) => (
+                      <th key={contract.id} className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right">
+                        {contract.pbm} <br/> <span className="text-[10px] font-mono font-normal opacity-75">{contract.plan}</span>
                       </th>
                     ))}
-                    <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider text-center">Best Plan</th>
+                    <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider text-center">Best Contract</th>
                     <th className="p-4 text-xs font-semibold text-slate-500 uppercase tracking-wider text-right">Arbitrage / Fill</th>
                   </tr>
                 </thead>
@@ -345,20 +356,20 @@ export default function DrugComparator() {
                       >
                         <td className="p-4 font-semibold text-slate-900">{item.drug.drug_name}</td>
                         
-                        {/* Dynamically generate pricing cells for every plan */}
-                        {plans.map((plan) => {
-                          const planPrice = item.prices[plan.plan_code] || 0;
-                          const isPlanLowest = planPrice > 0 && planPrice === item.lowestPrice;
+                        {/* Dynamically generate pricing cells for every PBM-Plan contract */}
+                        {contracts.map((contract) => {
+                          const contractPrice = item.prices[contract.id] || 0;
+                          const isContractLowest = contractPrice > 0 && contractPrice === item.lowestPrice;
                           return (
-                            <td key={plan.id} className={cn('p-4 text-right font-medium', isPlanLowest ? 'text-emerald-600 font-bold' : 'text-slate-600')}>
-                              {formatCurrency(planPrice)}
+                            <td key={contract.id} className={cn('p-4 text-right font-medium', isContractLowest ? 'text-emerald-600 font-bold' : 'text-slate-600')}>
+                              {formatCurrency(contractPrice)}
                             </td>
                           );
                         })}
 
                         <td className="p-4 text-center">
                           <span className="bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-bold px-2 py-0.5 rounded">
-                            {item.cheapestPlan?.plan_code || 'N/A'}
+                            {item.cheapestContract?.pbm || 'N/A'}
                           </span>
                         </td>
                         <td className="p-4 text-right">
