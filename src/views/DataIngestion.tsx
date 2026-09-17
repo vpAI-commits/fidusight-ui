@@ -1,8 +1,7 @@
-import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   FileUp,
   CheckCircle,
-  XCircle,
   Loader,
   HardDrive,
   Database,
@@ -10,32 +9,26 @@ import {
   FileText,
   Clock,
   Edit2,
-  Save,
-  CheckSquare
+  CheckSquare,
+  Trash2,
 } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
 import type { IngestionJob } from '@/lib/supabase';
-import { formatNumber, formatDateTime } from '@/lib/format';
+import { formatDateTime } from '@/lib/format';
 import { cn } from '@/lib/utils';
-
-const STATUS_CONFIG: Record<string, { badge: string; icon: typeof CheckCircle; label: string }> = {
-  COMPLETED: { badge: 'badge-success', icon: CheckCircle, label: 'Completed' },
-  PROCESSING: { badge: 'badge-info', icon: Loader, label: 'Processing' },
-  PENDING: { badge: 'badge-warning', icon: Clock, label: 'Pending' },
-};
 
 export default function DataIngestion() {
   const [jobs, setJobs] = useState<IngestionJob[]>([]);
   const [quarantined, setQuarantined] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [isUploading, setIsUploading] = useState(false);
+  const [isClearing, setIsClearing] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [activeTab, setActiveTab] = useState<'history' | 'review'>('history');
-  
+
   // Review System State
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<any>({});
-  
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const loadData = useCallback(async () => {
@@ -43,14 +36,49 @@ export default function DataIngestion() {
       supabase.from('ingestion_jobs').select('*').order('created_at', { ascending: false }),
       supabase.from('quarantined_claims').select('*').eq('status', 'NEEDS_REVIEW').order('created_at', { ascending: false }),
     ]);
+
     if (jobsRes.data) setJobs(jobsRes.data);
     if (quarantineRes.data) setQuarantined(quarantineRes.data);
+    
     setLoading(false);
   }, []);
 
   useEffect(() => {
     loadData();
   }, [loadData]);
+
+  // --- WIPE DATABASE COMMAND ---
+  const handleClearDatabase = async () => {
+    if (!window.confirm("Are you sure you want to wipe all transaction data? This will delete all claims, ingestion jobs, and anomalies, but keep your master drug lists intact.")) {
+      return;
+    }
+
+    setIsClearing(true);
+    try {
+      const tablesToWipe = [
+        'claims', 
+        'quarantined_claims', 
+        'ingestion_jobs', 
+        'audit_anomalies', 
+        'audit_log', 
+        'drug_pbm_pricing'
+      ];
+
+      // A dummy UUID is used because Supabase JS requires a filter on delete() operations
+      const dummyUUID = '00000000-0000-0000-0000-000000000000';
+
+      for (const table of tablesToWipe) {
+        await supabase.from(table).delete().neq('id', dummyUUID);
+      }
+
+      await loadData();
+    } catch (error) {
+      console.error("Failed to clear database:", error);
+      alert("Failed to clear database. Check console for details.");
+    } finally {
+      setIsClearing(false);
+    }
+  };
 
   const handleFileUpload = async (file: File) => {
     if (!file) return;
@@ -96,7 +124,6 @@ export default function DataIngestion() {
     }
   };
 
-  // --- REVIEW MANAGEMENT SYSTEM LOGIC ---
   const startEditing = (claim: any) => {
     setEditingId(claim.id);
     setEditForm({ ...claim });
@@ -106,27 +133,30 @@ export default function DataIngestion() {
     if (!editingId) return;
     
     try {
-      // 1. Recalculate True Net Price with corrected values
+      // Recalculate True Net Price with corrected values
       const pharmacyAmt = parseFloat(editForm.amt_paid_pharmacy || 0);
       const rebate = parseFloat(editForm.rebate_passed_thru || 0);
       const tnp = pharmacyAmt - rebate;
 
       const cleanClaim = {
         pbm_vendor_id: editForm.pbm_vendor_id,
+        pbm_plan_id: editForm.pbm_plan_id,
         ndc_11: editForm.ndc_11,
         drug_name: editForm.drug_name,
+        rxcui: editForm.rxcui,
+        therapeutic_class: editForm.therapeutic_class,
+        brand_vs_generic: editForm.brand_vs_generic,
         amt_paid_pharmacy: pharmacyAmt,
         rebate_passed_thru: rebate,
         true_net_price: tnp
       };
 
-      // 2. Insert into the valid claims table
+      // 1. Insert into the valid claims table
       await supabase.from('claims').insert([cleanClaim]);
-
-      // 3. Delete from quarantine
+      // 2. Delete from quarantine
       await supabase.from('quarantined_claims').delete().eq('id', editingId);
-
-      // 4. Reset UI
+      
+      // Reset UI
       setEditingId(null);
       setEditForm({});
       await loadData();
@@ -195,9 +225,24 @@ export default function DataIngestion() {
 
       {/* UPLOAD SECTION */}
       <div className="card p-5">
-        <div className="flex items-center gap-2 mb-4">
-          <FileUp className="w-5 h-5 text-teal-600" />
-          <h3 className="font-bold text-slate-900">Python Agent Ingestion Queue</h3>
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2">
+            <FileUp className="w-5 h-5 text-teal-600" />
+            <h3 className="font-bold text-slate-900">Python Agent Ingestion Queue</h3>
+          </div>
+          
+          <button 
+            onClick={handleClearDatabase}
+            disabled={isClearing || isUploading}
+            className="btn py-1.5 px-3 text-xs bg-red-50 text-red-600 border border-red-200 hover:bg-red-100 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isClearing ? (
+              <Loader className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Trash2 className="w-3.5 h-3.5" />
+            )}
+            Reset Database
+          </button>
         </div>
         
         <input 
@@ -269,7 +314,7 @@ export default function DataIngestion() {
                         {job.filename}
                       </div>
                     </td>
-                    <td className="p-4 text-right text-slate-500">{job.file_size_mb?.toFixed(3) || '—'} MB</td>
+                    <td className="p-4 text-right text-slate-500">{job.file_size_mb?.toFixed(3) || '0.000'} MB</td>
                     <td className="p-4">
                       <span className="badge badge-success inline-flex items-center gap-1">
                         <CheckCircle className="w-3 h-3" /> Completed
@@ -309,7 +354,7 @@ export default function DataIngestion() {
                         <div className="text-xs font-semibold text-red-600 flex items-center gap-1">
                           <AlertCircle className="w-3 h-3" /> {claim.error_reason}
                         </div>
-                        <div className="text-xs text-slate-400 mt-1">PBM: {claim.pbm_vendor_id}</div>
+                        <div className="text-[10px] font-mono text-slate-400 mt-1 uppercase tracking-wider">{claim.pbm_vendor_id} — {claim.pbm_plan_id}</div>
                       </td>
                       
                       <td className="p-4 text-sm text-slate-700">{claim.drug_name}</td>
@@ -323,7 +368,7 @@ export default function DataIngestion() {
                             onChange={(e) => setEditForm({...editForm, ndc_11: e.target.value})}
                           />
                         ) : (
-                          <span className="text-sm font-mono text-slate-600">{claim.ndc_11 || '—'}</span>
+                          <span className="text-sm font-mono text-slate-600">{claim.ndc_11 || '--'}</span>
                         )}
                       </td>
 
@@ -336,7 +381,7 @@ export default function DataIngestion() {
                             onChange={(e) => setEditForm({...editForm, amt_paid_pharmacy: e.target.value})}
                           />
                         ) : (
-                          <span className="text-sm text-slate-600">${claim.amt_paid_pharmacy || '—'}</span>
+                          <span className="text-sm text-slate-600">${claim.amt_paid_pharmacy || '--'}</span>
                         )}
                       </td>
 
@@ -344,7 +389,7 @@ export default function DataIngestion() {
                         {isEditing ? (
                           <div className="flex items-center justify-end gap-2">
                             <button onClick={() => setEditingId(null)} className="text-xs text-slate-500 hover:text-slate-700">Cancel</button>
-                            <button onClick={handleApprove} className="btn-primary py-1 px-3 text-xs flex items-center gap-1">
+                            <button onClick={handleApprove} className="bg-teal-600 text-white hover:bg-teal-700 rounded py-1 px-3 text-xs flex items-center gap-1">
                               <CheckSquare className="w-3 h-3" /> Approve
                             </button>
                           </div>
@@ -357,6 +402,7 @@ export default function DataIngestion() {
                     </tr>
                   );
                 })}
+                
                 {quarantined.length === 0 && (
                   <tr>
                     <td colSpan={5} className="p-12 text-center">
