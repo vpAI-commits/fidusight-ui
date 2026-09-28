@@ -69,7 +69,9 @@ export default function ComplianceAudit() {
       .filter((a) => a.status === 'OPEN')
       .reduce((sum, a) => sum + Number(a.dollar_amount || 0), 0);
     const spreadViolations = anomalies.filter((a) => a.anomaly_type === 'VIOLATION_SPREAD_PRICING').length;
-    const rebateLeakage = anomalies.filter((a) => a.anomaly_type === 'AGGREGATOR_LEAKAGE_AUDIT').length;
+    const rebateLeakage = anomalies
+      .filter((a) => a.anomaly_type === 'AGGREGATOR_LEAKAGE_AUDIT')
+      .reduce((sum, a) => sum + Number(a.dollar_amount || 0), 0);
 
     return { open, critical, totalExposure, spreadViolations, rebateLeakage, total: anomalies.length };
   }, [anomalies]);
@@ -115,7 +117,6 @@ export default function ComplianceAudit() {
 
   return (
     <div className="p-6 space-y-6 max-w-7xl mx-auto animate-fade-in">
-      {/* Statutory Header */}
       <div className="card p-5 bg-gradient-to-r from-slate-900 to-slate-800 text-white flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <div className="flex items-center gap-2">
@@ -134,7 +135,6 @@ export default function ComplianceAudit() {
         </div>
       </div>
 
-      {/* KPI Stats */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
         <div className="stat-card">
           <div className="flex items-center gap-2 mb-1">
@@ -184,11 +184,10 @@ export default function ComplianceAudit() {
               <InfoTooltip text="Manufacturer rebates retained by GPOs or aggregators." />
             </span>
           </div>
-          <div className="text-2xl font-bold text-purple-600">{stats.rebateLeakage}</div>
+          <div className="text-2xl font-bold text-purple-600">{formatCurrency(stats.rebateLeakage)}</div>
         </div>
       </div>
 
-      {/* Anomalies Table */}
       <div className="card overflow-hidden">
         <div className="p-4 border-b border-slate-200 bg-slate-50/70 flex items-center justify-between">
           <h3 className="font-semibold text-slate-900 text-xs uppercase tracking-wider">
@@ -265,10 +264,8 @@ export default function ComplianceAudit() {
         </div>
       </div>
 
-      {/* Selected Violation Panel & Cure Notice Generator */}
       {selectedAnomaly && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 animate-slide-in">
-          {/* Detail Card */}
           <div className="card p-5 border-l-4 border-l-red-500">
             <div className="flex items-center justify-between mb-4">
               <h3 className="font-bold text-slate-900">Fiduciary Breach Evidence File</h3>
@@ -292,7 +289,7 @@ export default function ComplianceAudit() {
                 </span>
               </div>
               <div className="py-2 border-b border-slate-100">
-                <span className="text-slate-500 block mb-1">Auditor Finding</span>
+                <span className="text-slate-500 block mb-1">Auditor Finding & Remediation</span>
                 <p className="text-slate-700 text-xs leading-relaxed bg-slate-50 p-2.5 rounded border border-slate-200">
                   {selectedAnomaly.description}
                 </p>
@@ -309,7 +306,6 @@ export default function ComplianceAudit() {
             </button>
           </div>
 
-          {/* Cure Notice Preview */}
           {showCureNotice && (
             <div className="card p-5 border-l-4 border-l-emerald-500 animate-fade-in">
               <div className="flex items-center justify-between mb-4">
