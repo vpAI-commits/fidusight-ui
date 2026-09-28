@@ -100,21 +100,6 @@ function App() {
         >
           <ChevronRight className={cn('w-4 h-4 transition-transform', sidebarCollapsed ? '' : 'rotate-180')} />
         </button>
-
-        {/* Compliance footer */}
-        {!sidebarCollapsed && (
-          <div className="p-3 border-t border-slate-200">
-            <div className="rounded-lg bg-slate-50 p-3 space-y-1">
-              <div className="flex items-center gap-2 text-xs font-semibold text-slate-700">
-                <ShieldAlert className="w-3.5 h-3.5 text-emerald-600" />
-                CAA 2026 Compliant
-              </div>
-              <p className="text-xs text-slate-400 leading-relaxed">
-                HIPAA • SOC2 Type II • ERISA §408(b)(2)
-              </p>
-            </div>
-          </div>
-        )}
       </aside>
 
       {/* Main content */}
